@@ -2,7 +2,6 @@ package com.baseflow.geolocator;
 
 import android.app.Activity;
 import android.content.Context;
-import android.location.Location;
 import android.util.Log;
 
 import androidx.annotation.Nullable;
@@ -20,6 +19,7 @@ import java.util.Map;
 
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.EventChannel;
+import io.flutter.plugin.common.MethodChannel;
 
 class StreamHandlerImpl implements EventChannel.StreamHandler {
   private static final String TAG = "FlutterGeolocator";
@@ -32,6 +32,11 @@ class StreamHandlerImpl implements EventChannel.StreamHandler {
   @Nullable private GeolocatorLocationService foregroundLocationService;
   @Nullable private GeolocationManager geolocationManager;
   @Nullable private LocationClient locationClient;
+  @Nullable private EventChannel.EventSink activeEvents;
+  private boolean usesForegroundService;
+  private boolean forceLocationManager;
+  @Nullable private LocationOptions activeOptions;
+  private long generation;
 
   public StreamHandlerImpl(PermissionManager permissionManager, GeolocationManager geolocationManager) {
     this.permissionManager = permissionManager;
@@ -81,7 +86,7 @@ class StreamHandlerImpl implements EventChannel.StreamHandler {
       return;
     }
 
-    disposeListeners(false);
+    disposeListeners();
     channel.setStreamHandler(null);
     channel = null;
   }
@@ -105,14 +110,9 @@ class StreamHandlerImpl implements EventChannel.StreamHandler {
       return;
     }
 
-    if (foregroundLocationService == null) {
-      Log.e(TAG, "Location background service has not started correctly");
-      return;
-    }
-
     @SuppressWarnings("unchecked")
     Map<String, Object> map = (Map<String, Object>) arguments;
-    boolean forceLocationManager = false;
+    forceLocationManager = false;
     if (map != null && map.get("forceLocationManager") != null) {
       forceLocationManager = (boolean) map.get("forceLocationManager");
     }
@@ -124,38 +124,91 @@ class StreamHandlerImpl implements EventChannel.StreamHandler {
           ForegroundNotificationOptions.parseArguments(
               (Map<String, Object>) map.get("foregroundNotificationConfig"));
     }
-    if (foregroundNotificationOptions != null) {
-      Log.e(TAG, "Geolocator position updates started using Android foreground service");
-      foregroundLocationService.startLocationService(forceLocationManager, locationOptions, events);
-      foregroundLocationService.enableBackgroundMode(foregroundNotificationOptions);
-    } else {
-      Log.e(TAG, "Geolocator position updates started");
-      locationClient =
-          geolocationManager.createLocationClient(
-              context, Boolean.TRUE.equals(forceLocationManager), locationOptions);
+    if (activeEvents != null) disposeListeners();
+    activeEvents = events;
+    activeOptions = locationOptions;
+    usesForegroundService = foregroundNotificationOptions != null;
+    try {
+      if (usesForegroundService) {
+        if (foregroundLocationService == null) {
+          throw new IllegalStateException("Location background service is not connected yet");
+        }
+        // Foreground promotion must succeed before requesting updates.
+        foregroundLocationService.enableBackgroundMode(foregroundNotificationOptions, events);
+        foregroundLocationService.startLocationService(forceLocationManager, locationOptions, events);
+      } else {
+        startDirectUpdates(events);
+      }
+    } catch (RuntimeException error) {
+      disposeListeners();
+      ErrorCodes code = error instanceof SecurityException ? ErrorCodes.permissionDenied
+          : ErrorCodes.errorWhileAcquiringPosition;
+      events.error(code.toString(), error.getMessage(), null);
+    }
+  }
 
-      geolocationManager.startPositionUpdates(
-          locationClient,
-          activity,
-          (Location location) -> events.success(LocationMapper.toHashMap(location)),
-          (ErrorCodes errorCodes) ->
-              events.error(errorCodes.toString(), errorCodes.toDescription(), null));
+  private void startDirectUpdates(EventChannel.EventSink events) {
+    long requestGeneration = ++generation;
+    locationClient = geolocationManager.createLocationClient(context, forceLocationManager, activeOptions);
+    geolocationManager.startPositionUpdates(locationClient, activity,
+        location -> {
+          if (activeEvents == events && generation == requestGeneration) {
+            events.success(LocationMapper.toHashMap(location));
+          }
+        },
+        error -> {
+          if (activeEvents == events && generation == requestGeneration) {
+            events.error(error.toString(), error.toDescription(), null);
+          }
+        });
+  }
+
+  void restartPositionUpdates(MethodChannel.Result result) {
+    if (activeEvents == null) {
+      result.success(false);
+      return;
+    }
+    try {
+      if (!permissionManager.hasPermission(context)) {
+        result.error(ErrorCodes.permissionDenied.toString(), ErrorCodes.permissionDenied.toDescription(), null);
+        return;
+      }
+      if (usesForegroundService) {
+        if (foregroundLocationService == null) {
+          result.error(ErrorCodes.errorWhileAcquiringPosition.toString(), "Location service is disconnected", null);
+          return;
+        }
+        result.success(foregroundLocationService.restartLocationService(activeEvents));
+      } else {
+        ++generation;
+        if (locationClient != null) geolocationManager.stopPositionUpdates(locationClient);
+        startDirectUpdates(activeEvents);
+        result.success(true);
+      }
+    } catch (PermissionUndefinedException error) {
+      result.error(ErrorCodes.permissionDefinitionsNotFound.toString(), error.getMessage(), null);
+    } catch (RuntimeException error) {
+      ErrorCodes code = error instanceof SecurityException ? ErrorCodes.permissionDenied
+          : ErrorCodes.errorWhileAcquiringPosition;
+      result.error(code.toString(), error.getMessage(), null);
     }
   }
 
   @Override
   public void onCancel(Object arguments) {
-    disposeListeners(true);
+    disposeListeners();
   }
 
-  private void disposeListeners(boolean cancelled) {
-    Log.e(TAG, "Geolocator position updates stopped");
-    if (foregroundLocationService != null && foregroundLocationService.canStopLocationService(cancelled)) {
-      foregroundLocationService.stopLocationService();
-      foregroundLocationService.disableBackgroundMode();
-    } else {
-      Log.e(TAG, "There is still another flutter engine connected, not stopping location service");
+  private void disposeListeners() {
+    ++generation;
+    EventChannel.EventSink events = activeEvents;
+    activeEvents = null;
+    activeOptions = null;
+    if (usesForegroundService && foregroundLocationService != null) {
+      if (events != null) foregroundLocationService.stopLocationService(events);
+      if (!foregroundLocationService.hasLocationSessions()) foregroundLocationService.disableBackgroundMode();
     }
+    usesForegroundService = false;
     if (locationClient != null && geolocationManager != null) {
       geolocationManager.stopPositionUpdates(locationClient);
       locationClient = null;

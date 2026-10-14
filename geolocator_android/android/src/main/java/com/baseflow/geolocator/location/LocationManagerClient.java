@@ -200,18 +200,26 @@ class LocationManagerClient implements LocationClient, LocationListenerCompat {
   @Override
   public void stopPositionUpdates() {
     this.isListening = false;
+    this.positionChangedCallback = null;
+    this.errorCallback = null;
     this.nmeaClient.stop();
     this.locationManager.removeUpdates(this);
   }
 
   @Override
   public synchronized void onLocationChanged(Location location) {
+    if (!isListening) return;
     if (isBetterLocation(location, currentBestLocation)) {
       this.currentBestLocation = location;
 
       if (this.positionChangedCallback != null) {
+        location = new Location(location);
+        location.setExtras(location.getExtras() == null
+            ? new android.os.Bundle() : new android.os.Bundle(location.getExtras()));
+        location.getExtras().putBoolean(LocationOptions.USE_MSL_ALTITUDE_EXTRA,
+            locationOptions != null && locationOptions.isUseMSLAltitude());
         nmeaClient.enrichExtrasWithNmea(location);
-        this.positionChangedCallback.onPositionChanged(currentBestLocation);
+        this.positionChangedCallback.onPositionChanged(location);
       }
     }
   }

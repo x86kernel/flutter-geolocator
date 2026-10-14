@@ -55,20 +55,14 @@ class AndroidSettings extends LocationSettings {
   /// background service package that will start a new Flutter Engine that is not tied to your main activity.
   final ForegroundNotificationConfig? foregroundNotificationConfig;
 
-  /// Set to true if altitude should be calculated as MSL (EGM2008) from NMEA messages
-  /// and reported as the altitude instead of using the geoidal height (WSG84). Setting
-  /// this property true will help to align Android altitude to that of iOS which uses MSL.
+  /// Prefer mean sea level (MSL) altitude from Android 14+ or NMEA messages.
+  /// Otherwise returns WGS84 ellipsoid altitude. Defaults to false, which
+  /// always keeps ellipsoid altitude even when native MSL data is available.
   ///
-  /// If the NMEA message is empty then the altitude reported will still be the standard WSG84
-  /// altitude from the GPS receiver.
-  ///
-  /// MSL Altitude is only available starting from Android N and not all devices support
-  /// NMEA message returning $GPGGA sequences.
-  ///
-  /// This property only works with position stream updates and has no effect when getting the
-  /// current position or last known position.
-  ///
-  /// Defaults to false
+  /// When true and MSL is unavailable, falls back to ellipsoid altitude.
+  /// Inspect `AndroidPosition.altitudeReference` to distinguish these values.
+  /// Applies to position streams and current-position requests; last-known
+  /// positions use ellipsoid altitude.
   final bool useMSLAltitude;
 
   @override

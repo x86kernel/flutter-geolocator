@@ -185,6 +185,7 @@
     
   }];
   [_geolocationHandler locationManager:_mockLocationManager didUpdateLocations: @[mockLocation]];
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didUpdateLocations: @[mockLocation]];
   
   [self waitForExpectationsWithTimeout:5.0 handler:nil];
   
@@ -333,6 +334,129 @@
   
   OCMVerify(never(), [_mockLocationManager setDesiredAccuracy:kCLLocationAccuracyBest]);
   OCMVerify(never(), [_mockLocationManager setDistanceFilter:kCLDistanceFilterNone]);
+}
+
+- (void)listenForBatchWithHandler:(GeolocatorResult)handler {
+  [_geolocationHandler startListeningWithDesiredAccuracy:kCLLocationAccuracyBest
+                                         distanceFilter:0
+                      pauseLocationUpdatesAutomatically:NO
+                        showBackgroundLocationIndicator:NO
+                                           activityType:CLActivityTypeFitness
+                         allowBackgroundLocationUpdates:NO
+                                          resultHandler:handler
+                                           errorHandler:^(NSString *code, NSString *description) {
+    XCTFail(@"Unexpected error: %@", code);
+  }];
+}
+
+- (void)testStreamDeliversEntireBatchInOrderIncludingOlderFixes {
+  NSDate *now = [NSDate date];
+  CLLocation *first = [[CLLocation alloc] initWithCoordinate:CLLocationCoordinate2DMake(54.0, 6.4)
+      altitude:10 horizontalAccuracy:5 verticalAccuracy:5 timestamp:[now dateByAddingTimeInterval:-10]];
+  CLLocation *second = [[CLLocation alloc] initWithCoordinate:CLLocationCoordinate2DMake(54.1, 6.4)
+      altitude:11 horizontalAccuracy:5 verticalAccuracy:5 timestamp:now];
+  NSMutableArray<CLLocation *> *received = [NSMutableArray array];
+  [self listenForBatchWithHandler:^(CLLocation *location) { [received addObject:location]; }];
+  [_geolocationHandler locationManager:_mockLocationManager didUpdateLocations:@[first, second]];
+  XCTAssertEqualObjects(received, (@[first, second]));
+  XCTAssertEqualObjects(received[0].timestamp, first.timestamp);
+  XCTAssertEqualObjects(received[1].timestamp, second.timestamp);
+}
+
+- (void)testStoppingStreamDuringBatchStopsRemainingDelivery {
+  __block NSUInteger received = 0;
+  GeolocationHandler *handler = _geolocationHandler;
+  [self listenForBatchWithHandler:^(CLLocation *location) {
+    received++;
+    [handler stopListening];
+  }];
+  CLLocation *location = [[CLLocation alloc] initWithLatitude:54 longitude:6.4];
+  [_geolocationHandler locationManager:_mockLocationManager didUpdateLocations:@[location, location]];
+  XCTAssertEqual(received, 1u);
+}
+
+- (void)testOneShotStillReturnsOnlyNewestFixFromBatch {
+  __block NSUInteger received = 0;
+  CLLocation *first = [[CLLocation alloc] initWithLatitude:54 longitude:6.4];
+  CLLocation *second = [[CLLocation alloc] initWithLatitude:54.1 longitude:6.4];
+  [_geolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyBest
+      resultHandler:^(CLLocation *location) {
+        received++;
+        XCTAssertEqual(location, second);
+      } errorHandler:^(NSString *code, NSString *description) { XCTFail(); }];
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didUpdateLocations:@[first, second]];
+  XCTAssertEqual(received, 1u);
+}
+
+- (void)testEmptyBatchDoesNotDeliverStreamEvent {
+  [self listenForBatchWithHandler:^(CLLocation *location) { XCTFail(); }];
+  [_geolocationHandler locationManager:_mockLocationManager didUpdateLocations:@[]];
+}
+
+- (void)testOneShotAndStreamDeliverOnlyTheirOwnBatches {
+  CLLocation *streamFix = [[CLLocation alloc] initWithLatitude:54 longitude:6.4];
+  CLLocation *oneShotFix = [[CLLocation alloc] initWithLatitude:55 longitude:6.4];
+  NSMutableArray *streamResults = [NSMutableArray array];
+  NSMutableArray *oneShotResults = [NSMutableArray array];
+  [self listenForBatchWithHandler:^(CLLocation *location) { [streamResults addObject:location]; }];
+  [_geolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyBest
+      resultHandler:^(CLLocation *location) { [oneShotResults addObject:location]; }
+      errorHandler:^(NSString *code, NSString *description) { XCTFail(); }];
+  [_geolocationHandler locationManager:_mockLocationManager didUpdateLocations:@[streamFix]];
+  XCTAssertEqual(oneShotResults.count, 0u);
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didUpdateLocations:@[oneShotFix]];
+  XCTAssertEqualObjects(streamResults, (@[streamFix]));
+  XCTAssertEqualObjects(oneShotResults, (@[oneShotFix]));
+}
+
+- (void)testOneShotFailureDoesNotFailRecordingStream {
+  __block NSUInteger streamFixes = 0;
+  __block NSUInteger oneShotErrors = 0;
+  [self listenForBatchWithHandler:^(CLLocation *location) { streamFixes++; }];
+  [_geolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyBest
+      resultHandler:^(CLLocation *location) { XCTFail(); }
+      errorHandler:^(NSString *code, NSString *description) { oneShotErrors++; }];
+  NSError *error = [NSError errorWithDomain:kCLErrorDomain code:kCLErrorDenied userInfo:nil];
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didFailWithError:error];
+  CLLocation *fix = [[CLLocation alloc] initWithLatitude:54 longitude:6.4];
+  [_geolocationHandler locationManager:_mockLocationManager didUpdateLocations:@[fix]];
+  XCTAssertEqual(oneShotErrors, 1u);
+  XCTAssertEqual(streamFixes, 1u);
+}
+
+- (void)testOneShotCallbackCanStartAnotherRequest {
+  __block NSUInteger results = 0;
+  GeolocationHandler *handler = _geolocationHandler;
+  [_geolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyBest
+      resultHandler:^(CLLocation *location) {
+        results++;
+        [handler requestPositionWithDesiredAccuracy:kCLLocationAccuracyBest
+            resultHandler:^(CLLocation *next) { results++; }
+            errorHandler:^(NSString *code, NSString *description) { XCTFail(); }];
+      } errorHandler:^(NSString *code, NSString *description) { XCTFail(); }];
+  CLLocation *fix = [[CLLocation alloc] initWithLatitude:54 longitude:6.4];
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didUpdateLocations:@[fix]];
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didUpdateLocations:@[fix]];
+  XCTAssertEqual(results, 2u);
+}
+
+- (void)testStreamFailureDoesNotConsumeOneShotRequest {
+  __block NSUInteger streamErrors = 0;
+  __block NSUInteger oneShotResults = 0;
+  [_geolocationHandler startListeningWithDesiredAccuracy:kCLLocationAccuracyBest
+      distanceFilter:0 pauseLocationUpdatesAutomatically:NO showBackgroundLocationIndicator:NO
+      activityType:CLActivityTypeFitness allowBackgroundLocationUpdates:NO
+      resultHandler:^(CLLocation *location) {}
+      errorHandler:^(NSString *code, NSString *description) { streamErrors++; }];
+  [_geolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyBest
+      resultHandler:^(CLLocation *location) { oneShotResults++; }
+      errorHandler:^(NSString *code, NSString *description) { XCTFail(); }];
+  NSError *error = [NSError errorWithDomain:kCLErrorDomain code:kCLErrorDenied userInfo:nil];
+  [_geolocationHandler locationManager:_mockLocationManager didFailWithError:error];
+  CLLocation *fix = [[CLLocation alloc] initWithLatitude:54 longitude:6.4];
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didUpdateLocations:@[fix]];
+  XCTAssertEqual(streamErrors, 1u);
+  XCTAssertEqual(oneShotResults, 1u);
 }
 
 @end

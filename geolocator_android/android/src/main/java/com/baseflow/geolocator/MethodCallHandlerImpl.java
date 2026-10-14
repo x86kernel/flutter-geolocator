@@ -45,6 +45,11 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
   @Nullable private Context context;
 
   @Nullable private Activity activity;
+  @Nullable private StreamHandlerImpl streamHandler;
+
+  void setStreamHandler(@Nullable StreamHandlerImpl streamHandler) {
+    this.streamHandler = streamHandler;
+  }
 
   MethodCallHandlerImpl(
       PermissionManager permissionManager,
@@ -61,6 +66,10 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
   @Override
   public void onMethodCall(@NonNull MethodCall call, @NonNull MethodChannel.Result result) {
     switch (call.method) {
+      case "restartPositionUpdates":
+        if (streamHandler == null) result.success(false);
+        else streamHandler.restartPositionUpdates(result);
+        break;
       case "checkPermission":
         onCheckPermission(result);
         break;
@@ -273,7 +282,7 @@ class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
 
     LocationClient locationClient = this.pendingCurrentPositionLocationClients.get(requestId);
     if (locationClient != null) {
-      locationClient.stopPositionUpdates();
+      geolocationManager.stopPositionUpdates(locationClient);
     }
     this.pendingCurrentPositionLocationClients.remove(requestId);
 

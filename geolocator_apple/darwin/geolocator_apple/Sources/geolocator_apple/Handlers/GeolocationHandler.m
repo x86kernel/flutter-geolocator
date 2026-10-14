@@ -21,6 +21,7 @@ double const kMaxLocationLifeTimeInSeconds = 5.0;
 
 @property(strong, nonatomic) GeolocatorResult currentLocationResultHandler;
 @property(strong, nonatomic) GeolocatorResult listenerResultHandler;
+@property(nonatomic) NSUInteger listenerGeneration;
 
 @end
 
@@ -97,6 +98,7 @@ double const kMaxLocationLifeTimeInSeconds = 5.0;
                             resultHandler:(GeolocatorResult _Nonnull )resultHandler
                              errorHandler:(GeolocatorError _Nonnull)errorHandler {
   
+  ++self.listenerGeneration;
   self.errorHandler = errorHandler;
   self.listenerResultHandler = resultHandler;
   
@@ -148,6 +150,7 @@ double const kMaxLocationLifeTimeInSeconds = 5.0;
 }
 
 - (void)stopListening {
+    ++self.listenerGeneration;
     [[self getLocationManager] stopUpdatingLocation];
     self.errorHandler = nil;
     self.listenerResultHandler = nil;
@@ -155,51 +158,42 @@ double const kMaxLocationLifeTimeInSeconds = 5.0;
 
 - (void)locationManager:(CLLocationManager *)manager
      didUpdateLocations:(NSArray<CLLocation *> *)locations {
-  if (!self.listenerResultHandler && !self.currentLocationResultHandler) return;
-  
-  CLLocation *mostRecentLocation = [locations lastObject];
-  NSTimeInterval ageInSeconds = -[mostRecentLocation.timestamp timeIntervalSinceNow];
-  // If location is older then 5.0 seconds it is likely a cached location which
-  // will be skipped.
-  if (manager == [self getOneTimeLocationManager] && ageInSeconds > kMaxLocationLifeTimeInSeconds) {
+  if (locations.count == 0) return;
+
+  if (manager == self.oneTimeLocationManager) {
+    CLLocation *latest = locations.lastObject;
+    if (-[latest.timestamp timeIntervalSinceNow] > kMaxLocationLifeTimeInSeconds) return;
+    GeolocatorResult result = self.currentLocationResultHandler;
+    // Clear before invoking client code: it may start another one-shot request.
+    [self stopOneTimeLocationListening];
+    if (result) result(latest);
     return;
   }
-  
-  if ([locations lastObject]) {
-    if (self.currentLocationResultHandler != nil) {
-      self.currentLocationResultHandler(mostRecentLocation);
-    }
-    if (self.listenerResultHandler != nil) {
-      self.listenerResultHandler(mostRecentLocation);
-    }
-  }
-  
-  self.currentLocationResultHandler = nil;
-  if (manager == [self getOneTimeLocationManager]) {
-    [self stopOneTimeLocationListening];
+
+  if (manager != self.locationManager) return;
+  // A one-shot manager must never inject its fixes into the recording stream.
+  // Core Location supplies these fixes in chronological order.
+  NSUInteger generation = self.listenerGeneration;
+  GeolocatorResult listener = self.listenerResultHandler;
+  for (CLLocation *location in locations) {
+    if (!listener || self.listenerGeneration != generation) break;
+    listener(location);
   }
 }
 
 - (void)locationManager:(CLLocationManager *)manager
        didFailWithError:(nonnull NSError *)error {
-  NSLog(@"LOCATION UPDATE FAILURE:"
-        "Error reason: %@"
-        "Error description: %@", error.localizedFailureReason, error.localizedDescription);
-  
-  if([error.domain isEqualToString:kCLErrorDomain] && error.code == kCLErrorLocationUnknown) {
+  if ([error.domain isEqualToString:kCLErrorDomain] && error.code == kCLErrorLocationUnknown) {
     return;
   }
-  
-  if (self.errorHandler) {
-    self.errorHandler(GeolocatorErrorLocationUpdateFailure, error.localizedDescription);
-  }
-  
-  if (self.oneTimeErrorHandler) {
-    self.oneTimeErrorHandler(GeolocatorErrorLocationUpdateFailure, error.localizedDescription);
-  }
-  
-  if (manager == [self getOneTimeLocationManager]) {
+
+  if (manager == self.oneTimeLocationManager) {
+    GeolocatorError handler = self.oneTimeErrorHandler;
     [self stopOneTimeLocationListening];
+    if (handler) handler(GeolocatorErrorLocationUpdateFailure, error.localizedDescription);
+  } else if (manager == self.locationManager) {
+    GeolocatorError handler = self.errorHandler;
+    if (handler) handler(GeolocatorErrorLocationUpdateFailure, error.localizedDescription);
   }
 }
 

@@ -36,62 +36,63 @@ class FusedLocationClient implements LocationClient {
   private static final String TAG = "FlutterGeolocator";
 
   private final Context context;
-  private final LocationCallback locationCallback;
+  private LocationCallback locationCallback;
+  private final SettingsClient settingsClient;
+  private long generation = 0;
+  private boolean active = false;
+  private boolean awaitingResolution = false;
   private final FusedLocationProviderClient fusedLocationProviderClient;
   private final NmeaClient nmeaClient;
-  private final int activityRequestCode;
+  private int activityRequestCode;
   @Nullable private final LocationOptions locationOptions;
 
   @Nullable private ErrorCallback errorCallback;
   @Nullable private PositionChangedCallback positionChangedCallback;
 
   public FusedLocationClient(@NonNull Context context, @Nullable LocationOptions locationOptions) {
+    this(context, locationOptions, LocationServices.getFusedLocationProviderClient(context),
+        LocationServices.getSettingsClient(context), new NmeaClient(context, locationOptions));
+  }
+
+  // Dependencies are injectable so delayed Google Play services tasks can be tested.
+  FusedLocationClient(Context context, LocationOptions locationOptions,
+      FusedLocationProviderClient provider, SettingsClient settingsClient, NmeaClient nmeaClient) {
     this.context = context;
-    this.fusedLocationProviderClient = LocationServices.getFusedLocationProviderClient(context);
     this.locationOptions = locationOptions;
-    this.nmeaClient = new NmeaClient(context, locationOptions);
-    this.activityRequestCode = generateActivityRequestCode();
+    this.fusedLocationProviderClient = provider;
+    this.settingsClient = settingsClient;
+    this.nmeaClient = nmeaClient;
+  }
 
-    locationCallback =
-        new LocationCallback() {
-          @Override
-          public synchronized void onLocationResult(@NonNull LocationResult locationResult) {
-            if (positionChangedCallback == null) {
-              Log.e(
-                  TAG,
-                  "LocationCallback was called with empty locationResult or no positionChangedCallback was registered.");
-              fusedLocationProviderClient.removeLocationUpdates(locationCallback);
-              if (errorCallback != null) {
-                errorCallback.onError(ErrorCodes.errorWhileAcquiringPosition);
-              }
-              return;
-            }
+  private boolean isActive(long requestGeneration) {
+    return active && generation == requestGeneration;
+  }
 
-            Location location = locationResult.getLastLocation();
-            if (location == null) {
-              return;
-            }
-            if (location.getExtras() == null) {
-              location.setExtras(Bundle.EMPTY);
-            }
-            if (locationOptions != null) {
-              location.getExtras().putBoolean(LocationOptions.USE_MSL_ALTITUDE_EXTRA, locationOptions.isUseMSLAltitude());
-            }
+  private LocationCallback createLocationCallback(long requestGeneration) {
+    return new LocationCallback() {
+      @Override
+      public void onLocationResult(@NonNull LocationResult result) {
+        if (!isActive(requestGeneration)) return;
+        // This client also backs getCurrentPosition: a one-shot consumer stops
+        // on its first callback, so retain Android's newest-fix semantics.
+        Location source = result.getLastLocation();
+        if (source == null || positionChangedCallback == null) return;
+        Location location = new Location(source);
+        location.setExtras(source.getExtras() == null ? new Bundle() : new Bundle(source.getExtras()));
+        location.getExtras().putBoolean(LocationOptions.USE_MSL_ALTITUDE_EXTRA,
+            locationOptions != null && locationOptions.isUseMSLAltitude());
+        nmeaClient.enrichExtrasWithNmea(location);
+        positionChangedCallback.onPositionChanged(location);
+      }
 
-            nmeaClient.enrichExtrasWithNmea(location);
-            positionChangedCallback.onPositionChanged(location);
-          }
-
-          @Override
-          public synchronized void onLocationAvailability(
-              @NonNull LocationAvailability locationAvailability) {
-            if (!locationAvailability.isLocationAvailable() && !checkLocationService(context)) {
-              if (errorCallback != null) {
-                errorCallback.onError(ErrorCodes.locationServicesDisabled);
-              }
-            }
-          }
-        };
+      @Override
+      public void onLocationAvailability(@NonNull LocationAvailability availability) {
+        if (isActive(requestGeneration) && !availability.isLocationAvailable()
+            && !checkLocationService(context) && errorCallback != null) {
+          errorCallback.onError(ErrorCodes.locationServicesDisabled);
+        }
+      }
+    };
   }
 
   private static LocationRequest buildLocationRequest(@Nullable LocationOptions options) {
@@ -152,11 +153,43 @@ class FusedLocationClient implements LocationClient {
   }
 
   @SuppressLint("MissingPermission")
-  private void requestPositionUpdates(LocationOptions locationOptions) {
-    LocationRequest locationRequest = buildLocationRequest(locationOptions);
-    this.nmeaClient.start();
-    fusedLocationProviderClient.requestLocationUpdates(
-        locationRequest, locationCallback, Looper.getMainLooper());
+  private void requestPositionUpdates(long requestGeneration) {
+    if (!isActive(requestGeneration)) return;
+    final LocationCallback callback = locationCallback;
+    try {
+      nmeaClient.start();
+      fusedLocationProviderClient.requestLocationUpdates(
+          buildLocationRequest(locationOptions), callback, Looper.getMainLooper())
+          .addOnSuccessListener(unused -> {
+            // Registration may finish after cancellation. Remove that registration only,
+            // never the callback belonging to a newer request.
+            if (!isActive(requestGeneration)) removeLocationUpdates(callback);
+          })
+          .addOnCanceledListener(() -> fail(requestGeneration, ErrorCodes.errorWhileAcquiringPosition))
+          .addOnFailureListener(error -> fail(requestGeneration,
+              error instanceof SecurityException ? ErrorCodes.permissionDenied
+                  : ErrorCodes.errorWhileAcquiringPosition));
+    } catch (RuntimeException error) {
+      fail(requestGeneration, error instanceof SecurityException ? ErrorCodes.permissionDenied
+          : ErrorCodes.errorWhileAcquiringPosition);
+    }
+  }
+
+  private void fail(long requestGeneration, ErrorCodes code) {
+    if (!isActive(requestGeneration)) return;
+    ErrorCallback callback = errorCallback;
+    stopPositionUpdates();
+    if (callback != null) callback.onError(code);
+  }
+
+  private void removeLocationUpdates(LocationCallback callback) {
+    if (callback == null) return;
+    try {
+      fusedLocationProviderClient.removeLocationUpdates(callback)
+          .addOnFailureListener(error -> Log.w(TAG, "Failed to remove location updates", error));
+    } catch (RuntimeException error) {
+      Log.w(TAG, "Failed to remove location updates", error);
+    }
   }
 
   @Override
@@ -200,25 +233,14 @@ class FusedLocationClient implements LocationClient {
   }
 
   public boolean onActivityResult(int requestCode, int resultCode) {
-    if (requestCode == activityRequestCode) {
-      if (resultCode == Activity.RESULT_OK) {
-        if (this.locationOptions == null
-            || this.positionChangedCallback == null
-            || this.errorCallback == null) {
-          return false;
-        }
-
-        requestPositionUpdates(this.locationOptions);
-
-        return true;
-      } else {
-        if (errorCallback != null) {
-          errorCallback.onError(ErrorCodes.locationServicesDisabled);
-        }
-      }
+    if (!active || !awaitingResolution || requestCode != activityRequestCode) return false;
+    awaitingResolution = false;
+    if (resultCode == Activity.RESULT_OK) {
+      requestPositionUpdates(generation);
+    } else {
+      fail(generation, ErrorCodes.locationServicesDisabled);
     }
-
-    return false;
+    return true;
   }
 
   @SuppressLint("MissingPermission")
@@ -226,57 +248,65 @@ class FusedLocationClient implements LocationClient {
       @Nullable Activity activity,
       @NonNull PositionChangedCallback positionChangedCallback,
       @NonNull ErrorCallback errorCallback) {
-
+    if (active) stopPositionUpdates();
+    final long requestGeneration = ++generation;
+    active = true;
+    awaitingResolution = false;
+    activityRequestCode = generateActivityRequestCode();
     this.positionChangedCallback = positionChangedCallback;
     this.errorCallback = errorCallback;
+    locationCallback = createLocationCallback(requestGeneration);
 
-    LocationRequest locationRequest = buildLocationRequest(this.locationOptions);
-    LocationSettingsRequest settingsRequest = buildLocationSettingsRequest(locationRequest);
-
-    SettingsClient settingsClient = LocationServices.getSettingsClient(context);
-    settingsClient
-        .checkLocationSettings(settingsRequest)
-        .addOnSuccessListener(
-            locationSettingsResponse -> requestPositionUpdates(this.locationOptions))
-        .addOnFailureListener(
-            e -> {
-              if (e instanceof ResolvableApiException) {
-                // When we don't have an activity return an error code explaining the
-                // location services are not enabled
-                if (activity == null) {
-                  errorCallback.onError(ErrorCodes.locationServicesDisabled);
-                  return;
-                }
-
-                ResolvableApiException rae = (ResolvableApiException) e;
-                int statusCode = rae.getStatusCode();
-                if (statusCode == LocationSettingsStatusCodes.RESOLUTION_REQUIRED) {
-                  try {
-                    // Show the dialog by calling startResolutionForResult(), and check the
-                    // result in onActivityResult().
-                    rae.startResolutionForResult(activity, activityRequestCode);
-                  } catch (IntentSender.SendIntentException sie) {
-                    errorCallback.onError(ErrorCodes.locationServicesDisabled);
-                  }
-                } else {
-                  errorCallback.onError(ErrorCodes.locationServicesDisabled);
-                }
-              } else {
-                ApiException ae = (ApiException) e;
-                int statusCode = ae.getStatusCode();
-                if (statusCode == LocationSettingsStatusCodes.SETTINGS_CHANGE_UNAVAILABLE) {
-                  requestPositionUpdates(this.locationOptions);
-                } else {
-                  // This should not happen according to Android documentation but it has been
-                  // observed on some phones.
-                  errorCallback.onError(ErrorCodes.locationServicesDisabled);
-                }
+    try {
+      settingsClient.checkLocationSettings(
+          buildLocationSettingsRequest(buildLocationRequest(locationOptions)))
+          .addOnSuccessListener(response -> requestPositionUpdates(requestGeneration))
+          .addOnCanceledListener(() -> fail(requestGeneration, ErrorCodes.errorWhileAcquiringPosition))
+          .addOnFailureListener(error -> {
+            if (!isActive(requestGeneration)) return;
+            if (error instanceof ResolvableApiException) {
+              ResolvableApiException resolvable = (ResolvableApiException) error;
+              if (activity == null
+                  || resolvable.getStatusCode() != LocationSettingsStatusCodes.RESOLUTION_REQUIRED) {
+                fail(requestGeneration, ErrorCodes.locationServicesDisabled);
+                return;
               }
-            });
+              try {
+                awaitingResolution = true;
+                resolvable.startResolutionForResult(activity, activityRequestCode);
+              } catch (IntentSender.SendIntentException exception) {
+                fail(requestGeneration, ErrorCodes.locationServicesDisabled);
+              }
+            } else if (error instanceof ApiException
+                && ((ApiException) error).getStatusCode()
+                    == LocationSettingsStatusCodes.SETTINGS_CHANGE_UNAVAILABLE) {
+              requestPositionUpdates(requestGeneration);
+            } else {
+              fail(requestGeneration, error instanceof SecurityException
+                  ? ErrorCodes.permissionDenied : ErrorCodes.locationServicesDisabled);
+            }
+          });
+    } catch (RuntimeException error) {
+      fail(requestGeneration, error instanceof SecurityException ? ErrorCodes.permissionDenied
+          : ErrorCodes.errorWhileAcquiringPosition);
+    }
   }
 
   public void stopPositionUpdates() {
-    this.nmeaClient.stop();
-    fusedLocationProviderClient.removeLocationUpdates(locationCallback);
+    // Invalidate first: queued settings, registration and location callbacks are stale.
+    active = false;
+    ++generation;
+    awaitingResolution = false;
+    positionChangedCallback = null;
+    errorCallback = null;
+    LocationCallback callback = locationCallback;
+    locationCallback = null;
+    try {
+      nmeaClient.stop();
+    } catch (RuntimeException error) {
+      Log.w(TAG, "Failed to remove auxiliary location listeners", error);
+    } finally {
+      removeLocationUpdates(callback);
+    }
   }
 }

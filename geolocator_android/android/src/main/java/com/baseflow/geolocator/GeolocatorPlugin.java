@@ -48,6 +48,7 @@ public class GeolocatorPlugin implements FlutterPlugin, ActivityAware {
           if (foregroundLocationService != null) {
             foregroundLocationService.setActivity(null);
             foregroundLocationService = null;
+            if (streamHandler != null) streamHandler.setForegroundLocationService(null);
           }
         }
       };
@@ -69,6 +70,7 @@ public class GeolocatorPlugin implements FlutterPlugin, ActivityAware {
     methodCallHandler.startListening(
         flutterPluginBinding.getApplicationContext(), flutterPluginBinding.getBinaryMessenger());
     streamHandler = new StreamHandlerImpl(this.permissionManager, this.geolocationManager);
+    methodCallHandler.setStreamHandler(streamHandler);
     streamHandler.startListening(
         flutterPluginBinding.getApplicationContext(), flutterPluginBinding.getBinaryMessenger());
 
@@ -163,6 +165,7 @@ public class GeolocatorPlugin implements FlutterPlugin, ActivityAware {
     foregroundLocationService = service;
     foregroundLocationService.setGeolocationManager(geolocationManager);
     foregroundLocationService.flutterEngineConnected();
+    if (pluginBinding != null) foregroundLocationService.setActivity(pluginBinding.getActivity());
 
     if (streamHandler != null) {
       streamHandler.setForegroundLocationService(service);
@@ -172,6 +175,7 @@ public class GeolocatorPlugin implements FlutterPlugin, ActivityAware {
   private void dispose() {
     Log.d(TAG, "Disposing Geolocator services");
     if (methodCallHandler != null) {
+      methodCallHandler.setStreamHandler(null);
       methodCallHandler.stopListening();
       methodCallHandler.setActivity(null);
       methodCallHandler = null;

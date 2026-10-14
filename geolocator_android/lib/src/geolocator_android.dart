@@ -204,6 +204,23 @@ class GeolocatorAndroid extends GeolocatorPlatform {
     return _positionStream!;
   }
 
+  /// Re-registers native location updates for this engine's active position stream.
+  ///
+  /// Keeps the Dart subscription, foreground notification and wake locks alive.
+  /// Use this instead of cancelling and subscribing again during recovery.
+  /// Returns false when no native stream is active. True means the restart was
+  /// requested; asynchronous provider failures still arrive on the stream.
+  /// This does not start a recording after process death or restore permission.
+  Future<bool> restartPositionUpdates() async {
+    try {
+      return await _methodChannel
+              .invokeMethod<bool>('restartPositionUpdates') ??
+          false;
+    } on PlatformException catch (e) {
+      throw _handlePlatformException(e);
+    }
+  }
+
   Stream<dynamic> _wrapStream(Stream<dynamic> incoming) {
     return incoming.asBroadcastStream(onCancel: (subscription) {
       subscription.cancel();
@@ -253,6 +270,7 @@ class GeolocatorAndroid extends GeolocatorPlatform {
         return PermissionDeniedException(exception.message);
       case 'PERMISSION_REQUEST_IN_PROGRESS':
         return PermissionRequestInProgressException(exception.message);
+      case 'ERROR_WHILE_ACQUIRING_POSITION':
       case 'LOCATION_UPDATE_FAILURE':
         return PositionUpdateException(exception.message);
       default:

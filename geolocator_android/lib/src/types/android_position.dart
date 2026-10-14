@@ -11,6 +11,7 @@ class AndroidPosition extends Position {
   /// instances constructed this way won't actually reflect any real information
   /// from the platform, just whatever was passed in at construction time.
   const AndroidPosition({
+    this.altitudeReference,
     required this.satelliteCount,
     required this.satellitesUsedInFix,
     required longitude,
@@ -61,6 +62,11 @@ class AndroidPosition extends Position {
           hasVerticalSpeedAccuracy: hasVerticalSpeedAccuracy,
         );
 
+  /// Datum of [altitude]: `ellipsoid` or `meanSeaLevel`.
+  /// Null when altitude is absent or the native plugin predates this field.
+  /// Check this when `AndroidSettings.useMSLAltitude` falls back to ellipsoid.
+  final String? altitudeReference;
+
   /// If available it returns the number of GNSS satellites.
   ///
   /// If the number of satellites is not available it returns the default value: 0.0.
@@ -75,6 +81,7 @@ class AndroidPosition extends Position {
   bool operator ==(Object other) {
     var areEqual = other is AndroidPosition &&
         super == other &&
+        other.altitudeReference == altitudeReference &&
         other.satelliteCount == satelliteCount &&
         other.satellitesUsedInFix == satellitesUsedInFix;
     return areEqual;
@@ -82,7 +89,10 @@ class AndroidPosition extends Position {
 
   @override
   int get hashCode =>
-      satelliteCount.hashCode ^ satellitesUsedInFix.hashCode ^ super.hashCode;
+      altitudeReference.hashCode ^
+      satelliteCount.hashCode ^
+      satellitesUsedInFix.hashCode ^
+      super.hashCode;
 
   /// Converts the supplied [Map] to an instance of the [AndroidPosition] class.
   static AndroidPosition fromMap(dynamic message) {
@@ -91,6 +101,7 @@ class AndroidPosition extends Position {
     final position = Position.fromMap(positionMap);
 
     return AndroidPosition(
+      altitudeReference: positionMap['altitude_reference'] as String?,
       satelliteCount: positionMap['gnss_satellite_count'] ?? 0.0,
       satellitesUsedInFix: positionMap['gnss_satellites_used_in_fix'] ?? 0.0,
       latitude: position.latitude,
@@ -125,6 +136,7 @@ class AndroidPosition extends Position {
   Map<String, dynamic> toJson() {
     return super.toJson()
       ..addAll({
+        'altitude_reference': altitudeReference,
         'gnss_satellite_count': satelliteCount,
         'gnss_satellites_used_in_fix': satellitesUsedInFix,
       });

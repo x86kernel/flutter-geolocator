@@ -6,7 +6,6 @@ import android.app.Notification;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
-import android.location.Location;
 import android.net.wifi.WifiManager;
 import android.os.Binder;
 import android.os.Build;
@@ -16,7 +15,6 @@ import android.util.Log;
 
 import androidx.annotation.Nullable;
 
-import com.baseflow.geolocator.errors.ErrorCodes;
 import com.baseflow.geolocator.location.BackgroundNotification;
 import com.baseflow.geolocator.location.ForegroundNotificationOptions;
 import com.baseflow.geolocator.location.GeolocationManager;
@@ -25,6 +23,8 @@ import com.baseflow.geolocator.location.LocationMapper;
 import com.baseflow.geolocator.location.LocationOptions;
 
 import io.flutter.plugin.common.EventChannel;
+import java.util.IdentityHashMap;
+import java.util.Map;
 
 public class GeolocatorLocationService extends Service {
   private static final String TAG = "FlutterGeolocator";
@@ -36,10 +36,24 @@ public class GeolocatorLocationService extends Service {
   // Service is foreground
   private boolean isForeground = false;
   private int connectedEngines = 0;
-  private int listenerCount = 0;
+  // Each engine owns its stream; cancelling one must not tear down another.
+  private final Map<EventChannel.EventSink, LocationSession> sessions = new IdentityHashMap<>();
+  private final Map<EventChannel.EventSink, ForegroundNotificationOptions> backgroundOptions =
+      new IdentityHashMap<>();
+
+  private static class LocationSession {
+    final boolean forceLocationManager;
+    final LocationOptions options;
+    @Nullable LocationClient client;
+    long generation;
+
+    LocationSession(boolean forceLocationManager, LocationOptions options) {
+      this.forceLocationManager = forceLocationManager;
+      this.options = options;
+    }
+  }
   @Nullable private Activity activity = null;
   @Nullable private GeolocationManager geolocationManager = null;
-  @Nullable private LocationClient locationClient;
 
   @Nullable private PowerManager.WakeLock wakeLock = null;
   @Nullable private WifiManager.WifiLock wifiLock = null;
@@ -83,13 +97,6 @@ public class GeolocatorLocationService extends Service {
     super.onDestroy();
   }
 
-  public boolean canStopLocationService(boolean cancellationRequested) {
-    if (cancellationRequested) {
-      return listenerCount == 1;
-    }
-    return connectedEngines == 0;
-  }
-
   public void flutterEngineConnected() {
 
     connectedEngines++;
@@ -107,47 +114,104 @@ public class GeolocatorLocationService extends Service {
       LocationOptions locationOptions,
       EventChannel.EventSink events) {
 
-    listenerCount++;
-    if (geolocationManager != null) {
-      locationClient =
-          geolocationManager.createLocationClient(
-              this.getApplicationContext(),
-              Boolean.TRUE.equals(forceLocationManager),
-              locationOptions);
-
-      geolocationManager.startPositionUpdates(
-          locationClient,
-          activity,
-          (Location location) -> events.success(LocationMapper.toHashMap(location)),
-          (ErrorCodes errorCodes) ->
-              events.error(errorCodes.toString(), errorCodes.toDescription(), null));
+    if (geolocationManager == null) {
+      throw new IllegalStateException("Location service is not initialized");
     }
+    // onListen owns foreground options already; replacing the native request
+    // must not release that owner's locks.
+    LocationSession previous = sessions.remove(events);
+    if (previous != null) stopSession(previous);
+    LocationSession session = new LocationSession(forceLocationManager, locationOptions);
+    sessions.put(events, session);
+    try {
+      startSession(events, session);
+    } catch (RuntimeException error) {
+      stopLocationService(events);
+      throw error;
+    }
+  }
+
+  private void stopSession(LocationSession session) {
+    ++session.generation;
+    LocationClient client = session.client;
+    session.client = null;
+    if (client != null && geolocationManager != null) {
+      try {
+        geolocationManager.stopPositionUpdates(client);
+      } catch (RuntimeException error) {
+        Log.w(TAG, "Failed to stop location client", error);
+      }
+    }
+  }
+
+  private void startSession(EventChannel.EventSink events, LocationSession session) {
+    stopSession(session);
+    final long generation = session.generation;
+    try {
+      session.client = geolocationManager.createLocationClient(
+          getApplicationContext(), session.forceLocationManager, session.options);
+      geolocationManager.startPositionUpdates(session.client, activity,
+          location -> {
+            if (sessions.get(events) == session && session.generation == generation) {
+              events.success(LocationMapper.toHashMap(location));
+            }
+          },
+          error -> {
+            if (sessions.get(events) == session && session.generation == generation) {
+              events.error(error.toString(), error.toDescription(), null);
+            }
+          });
+    } catch (RuntimeException error) {
+      stopSession(session);
+      throw error;
+    }
+  }
+
+  public boolean restartLocationService(EventChannel.EventSink events) {
+    LocationSession session = sessions.get(events);
+    if (session == null) return false;
+    // Keep configuration even if registration throws, so a later retry works.
+    // Foreground state and locks belong to the stream, not this native request.
+    startSession(events, session);
+    return true;
+  }
+
+  public void stopLocationService(EventChannel.EventSink events) {
+    LocationSession session = sessions.remove(events);
+    if (session != null) stopSession(session);
+    backgroundOptions.remove(events);
+    updateWakeLocks();
+  }
+
+  public boolean hasLocationSessions() {
+    return !sessions.isEmpty();
   }
 
   public void stopLocationService() {
-    listenerCount--;
-    Log.d(TAG, "Stopping location service.");
-    if (locationClient != null && geolocationManager != null) {
-      geolocationManager.stopPositionUpdates(locationClient);
+    for (EventChannel.EventSink events : sessions.keySet().toArray(new EventChannel.EventSink[0])) {
+      stopLocationService(events);
     }
   }
 
-  public void enableBackgroundMode(ForegroundNotificationOptions options) {
+  public void enableBackgroundMode(ForegroundNotificationOptions options, EventChannel.EventSink events) {
     if (backgroundNotification != null) {
       Log.d(TAG, "Service already in foreground mode.");
-      changeNotificationOptions(options);
+      backgroundNotification.updateOptions(options, isForeground);
     } else {
       Log.d(TAG, "Start service in foreground mode.");
 
-      backgroundNotification =
+      BackgroundNotification notificationBuilder =
           new BackgroundNotification(
               this.getApplicationContext(), CHANNEL_ID, ONGOING_NOTIFICATION_ID, options);
-      backgroundNotification.updateChannel(options.getNotificationChannelName());
-      Notification notification = backgroundNotification.build();
+      notificationBuilder.updateChannel(options.getNotificationChannelName());
+      Notification notification = notificationBuilder.build();
       startForeground(ONGOING_NOTIFICATION_ID, notification);
+      // A failed promotion must not make the next attempt look already active.
+      backgroundNotification = notificationBuilder;
       isForeground = true;
     }
-    obtainWakeLocks(options);
+    backgroundOptions.put(events, options);
+    updateWakeLocks();
   }
 
   @SuppressWarnings("deprecation")
@@ -159,16 +223,10 @@ public class GeolocatorLocationService extends Service {
       } else {
         stopForeground(true);
       }
+      backgroundOptions.clear();
       releaseWakeLocks();
       isForeground = false;
       backgroundNotification = null;
-    }
-  }
-
-  public void changeNotificationOptions(ForegroundNotificationOptions options) {
-    if (backgroundNotification != null) {
-      backgroundNotification.updateOptions(options, isForeground);
-      obtainWakeLocks(options);
     }
   }
 
@@ -192,25 +250,40 @@ public class GeolocatorLocationService extends Service {
   }
 
   @SuppressLint("WakelockTimeout")
-  private void obtainWakeLocks(ForegroundNotificationOptions options) {
-    releaseWakeLocks();
-    if (options.isEnableWakeLock()) {
-      PowerManager powerManager =
-          (PowerManager) getApplicationContext().getSystemService(Context.POWER_SERVICE);
-      if (powerManager != null) {
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG);
-        wakeLock.setReferenceCounted(false);
-        wakeLock.acquire();
-      }
+  private void updateWakeLocks() {
+    boolean needsWakeLock = false;
+    boolean needsWifiLock = false;
+    for (ForegroundNotificationOptions options : backgroundOptions.values()) {
+      needsWakeLock |= options.isEnableWakeLock();
+      needsWifiLock |= options.isEnableWifiLock();
     }
-    if (options.isEnableWifiLock()) {
-      WifiManager wifiManager =
-          (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-      if (wifiManager != null) {
-        wifiLock = wifiManager.createWifiLock(getWifiLockType(), WIFILOCK_TAG);
-        wifiLock.setReferenceCounted(false);
-        wifiLock.acquire();
+    if (needsWakeLock) {
+      if (wakeLock == null || !wakeLock.isHeld()) {
+        PowerManager powerManager =
+            (PowerManager) getApplicationContext().getSystemService(Context.POWER_SERVICE);
+        if (powerManager != null) {
+          wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG);
+          wakeLock.setReferenceCounted(false);
+          wakeLock.acquire();
+        }
       }
+    } else if (wakeLock != null) {
+      if (wakeLock.isHeld()) wakeLock.release();
+      wakeLock = null;
+    }
+    if (needsWifiLock) {
+      if (wifiLock == null || !wifiLock.isHeld()) {
+        WifiManager wifiManager =
+            (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (wifiManager != null) {
+          wifiLock = wifiManager.createWifiLock(getWifiLockType(), WIFILOCK_TAG);
+          wifiLock.setReferenceCounted(false);
+          wifiLock.acquire();
+        }
+      }
+    } else if (wifiLock != null) {
+      if (wifiLock.isHeld()) wifiLock.release();
+      wifiLock = null;
     }
   }
 

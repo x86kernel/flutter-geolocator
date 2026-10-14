@@ -22,7 +22,10 @@ public class LocationMapper {
     position.put("timestamp", location.getTime());
     position.put("is_mocked", isMocked(location));
 
-    if (location.hasAltitude()) position.put("altitude", location.getAltitude());
+    if (location.hasAltitude()) {
+      position.put("altitude", location.getAltitude());
+      position.put("altitude_reference", "ellipsoid");
+    }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && location.hasVerticalAccuracy())
       position.put("altitude_accuracy", location.getVerticalAccuracyMeters());
     if (location.hasAccuracy()) position.put("accuracy", (double) location.getAccuracy());
@@ -34,9 +37,13 @@ public class LocationMapper {
       position.put("speed_accuracy", (double) location.getSpeedAccuracyMetersPerSecond());
 
     if (location.getExtras() != null) {
-      if (location.getExtras().containsKey(NmeaClient.NMEA_ALTITUDE_EXTRA)) {
-        Double mslAltitude = location.getExtras().getDouble(NmeaClient.NMEA_ALTITUDE_EXTRA);
-        position.put("altitude", mslAltitude);
+      boolean useMslAltitude = location.getExtras().getBoolean(LocationOptions.USE_MSL_ALTITUDE_EXTRA, false);
+      Double nmeaAltitude = getDoubleExtra(location.getExtras(), NmeaClient.NMEA_ALTITUDE_EXTRA);
+      if (useMslAltitude && nmeaAltitude != null) {
+        position.put("altitude", nmeaAltitude);
+        position.put("altitude_reference", "meanSeaLevel");
+        // Ellipsoid uncertainty does not describe an independently sampled NMEA altitude.
+        position.remove("altitude_accuracy");
       }
       if (location.getExtras().containsKey(NmeaClient.GNSS_SATELLITE_COUNT_EXTRA)) {
         Double mslSatelliteCount =
@@ -48,10 +55,12 @@ public class LocationMapper {
             location.getExtras().getDouble(NmeaClient.GNSS_SATELLITES_USED_IN_FIX_EXTRA);
         position.put("gnss_satellites_used_in_fix", mslSatellitesUsedInFix);
       }
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && location.hasMslAltitude())
+      if (useMslAltitude && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && location.hasMslAltitude())
       {
         double mslAltitude = location.getMslAltitudeMeters();
         position.put("altitude", mslAltitude);
+        position.put("altitude_reference", "meanSeaLevel");
+        position.remove("altitude_accuracy");
         if (location.hasMslAltitudeAccuracy()) {
           float mslAccuracy = location.getMslAltitudeAccuracyMeters();
           position.put("altitude_accuracy", mslAccuracy);
