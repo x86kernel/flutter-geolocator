@@ -531,7 +531,10 @@ void main() {
         expect(channel.log, <Matcher>[
           isMethodCall(
             'getCurrentPosition',
-            arguments: expectedArguments.toJson(),
+            arguments: {
+              ...expectedArguments.toJson(),
+              'requestId': (channel.log.single.arguments as Map)['requestId'],
+            },
           ),
         ]);
       });
@@ -567,11 +570,17 @@ void main() {
         expect(channel.log, <Matcher>[
           isMethodCall(
             'getCurrentPosition',
-            arguments: expectedFirstArguments.toJson(),
+            arguments: {
+              ...expectedFirstArguments.toJson(),
+              'requestId': (channel.log.first.arguments as Map)['requestId'],
+            },
           ),
           isMethodCall(
             'getCurrentPosition',
-            arguments: expectedSecondArguments.toJson(),
+            arguments: {
+              ...expectedSecondArguments.toJson(),
+              'requestId': (channel.log.last.arguments as Map)['requestId'],
+            },
           ),
         ]);
       });

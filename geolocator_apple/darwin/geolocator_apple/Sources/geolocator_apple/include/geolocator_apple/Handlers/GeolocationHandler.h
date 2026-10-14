@@ -22,6 +22,14 @@ typedef void (^GeolocatorResult)(CLLocation *_Nullable location);
                              resultHandler:(GeolocatorResult _Nonnull)resultHandler
                               errorHandler:(GeolocatorError _Nonnull)errorHandler;
 
+/// A nil ID preserves compatibility with callers that do not support cancellation.
+- (void)requestPositionWithDesiredAccuracy:(CLLocationAccuracy)desiredAccuracy
+                                requestId:(NSString *_Nullable)requestId
+                            resultHandler:(GeolocatorResult _Nonnull)resultHandler
+                             errorHandler:(GeolocatorError _Nonnull)errorHandler;
+
+- (void)cancelGetCurrentPositionWithRequestId:(NSString *_Nullable)requestId;
+
 - (void)startListeningWithDesiredAccuracy:(CLLocationAccuracy)desiredAccuracy
                            distanceFilter:(CLLocationDistance)distanceFilter
         pauseLocationUpdatesAutomatically:(BOOL)pauseLocationUpdatesAutomatically

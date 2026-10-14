@@ -8,8 +8,20 @@
 #import "../include/geolocator_apple/Handlers/GeolocationHandler.h"
 #import "../include/geolocator_apple/Handlers/GeolocationHandler_Test.h"
 #import "../include/geolocator_apple/Constants/ErrorCodes.h"
+#import <float.h>
 
 double const kMaxLocationLifeTimeInSeconds = 5.0;
+
+// All outstanding one-shot requests share a manager, using the most demanding
+// requested accuracy. Their callbacks and cancellation remain independent.
+@interface GeolocationRequest : NSObject
+@property(nonatomic) CLLocationAccuracy desiredAccuracy;
+@property(copy, nonatomic) GeolocatorResult resultHandler;
+@property(copy, nonatomic) GeolocatorError errorHandler;
+@end
+
+@implementation GeolocationRequest
+@end
 
 @interface GeolocationHandler() <CLLocationManagerDelegate>
 
@@ -17,9 +29,8 @@ double const kMaxLocationLifeTimeInSeconds = 5.0;
 @property(strong, nonatomic) GeolocatorError errorHandler;
 
 @property(strong, nonatomic, nonnull) CLLocationManager *oneTimeLocationManager;
-@property(strong, nonatomic) GeolocatorError oneTimeErrorHandler;
+@property(strong, nonatomic) NSMutableDictionary<NSString *, GeolocationRequest *> *requests;
 
-@property(strong, nonatomic) GeolocatorResult currentLocationResultHandler;
 @property(strong, nonatomic) GeolocatorResult listenerResultHandler;
 @property(nonatomic) NSUInteger listenerGeneration;
 
@@ -34,6 +45,7 @@ double const kMaxLocationLifeTimeInSeconds = 5.0;
     return nil;
   }
   
+  self.requests = [NSMutableDictionary dictionary];
   return self;
 }
 
@@ -74,19 +86,57 @@ double const kMaxLocationLifeTimeInSeconds = 5.0;
 - (void)requestPositionWithDesiredAccuracy:(CLLocationAccuracy)desiredAccuracy
                              resultHandler:(GeolocatorResult _Nonnull)resultHandler
                               errorHandler:(GeolocatorError _Nonnull)errorHandler {
-  self.oneTimeErrorHandler = errorHandler;
-  self.currentLocationResultHandler = resultHandler;
-  
-  BOOL showBackgroundLocationIndicator = NO;
-  BOOL allowBackgroundLocationUpdates = NO;
-  
-  [self startUpdatingLocationWithDesiredAccuracy:desiredAccuracy
-                                  distanceFilter:kCLDistanceFilterNone
-               pauseLocationUpdatesAutomatically:NO
-                                    activityType:CLActivityTypeOther
-                   isListeningForPositionUpdates:NO
-                 showBackgroundLocationIndicator:showBackgroundLocationIndicator
-                  allowBackgroundLocationUpdates:allowBackgroundLocationUpdates];
+  [self requestPositionWithDesiredAccuracy:desiredAccuracy
+                                requestId:NSUUID.UUID.UUIDString
+                            resultHandler:resultHandler
+                             errorHandler:errorHandler];
+}
+
+- (void)requestPositionWithDesiredAccuracy:(CLLocationAccuracy)desiredAccuracy
+                                requestId:(NSString *)requestId
+                            resultHandler:(GeolocatorResult)resultHandler
+                             errorHandler:(GeolocatorError)errorHandler {
+  NSString *identifier = requestId ?: NSUUID.UUID.UUIDString;
+  if (self.requests[identifier]) {
+    errorHandler(GeolocatorErrorLocationUpdateFailure, @"A location request with this ID is already active.");
+    return;
+  }
+  BOOL shouldStart = self.requests.count == 0;
+  GeolocationRequest *request = [[GeolocationRequest alloc] init];
+  request.desiredAccuracy = desiredAccuracy;
+  request.resultHandler = resultHandler;
+  request.errorHandler = errorHandler;
+  self.requests[identifier] = request;
+
+  [self updateOneTimeLocationAccuracy];
+  if (shouldStart) {
+    CLLocationManager *manager = [self getOneTimeLocationManager];
+    manager.distanceFilter = kCLDistanceFilterNone;
+    [manager startUpdatingLocation];
+  }
+}
+
+- (void)updateOneTimeLocationAccuracy {
+  CLLocationAccuracy accuracy = DBL_MAX;
+  for (GeolocationRequest *request in self.requests.allValues) {
+    accuracy = MIN(accuracy, request.desiredAccuracy);
+  }
+  [self getOneTimeLocationManager].desiredAccuracy = accuracy;
+}
+
+- (void)cancelGetCurrentPositionWithRequestId:(NSString *)requestId {
+  if (!requestId) return;
+  GeolocationRequest *request = self.requests[requestId];
+  if (!request) return;
+  [self.requests removeObjectForKey:requestId];
+  if (self.requests.count == 0) {
+    [self stopOneTimeLocationListening];
+  } else {
+    [self updateOneTimeLocationAccuracy];
+  }
+  // Settle the original method-channel call as well as the cancellation call.
+  // Dart has already timed out and will ignore this result.
+  request.resultHandler(nil);
 }
 
 - (void)startListeningWithDesiredAccuracy:(CLLocationAccuracy)desiredAccuracy
@@ -144,9 +194,8 @@ double const kMaxLocationLifeTimeInSeconds = 5.0;
 }
 
 - (void)stopOneTimeLocationListening {
-  [[self getOneTimeLocationManager] stopUpdatingLocation];
-  self.oneTimeErrorHandler = nil;
-  self.currentLocationResultHandler = nil;
+  [self.oneTimeLocationManager stopUpdatingLocation];
+  [self.requests removeAllObjects];
 }
 
 - (void)stopListening {
@@ -163,10 +212,13 @@ double const kMaxLocationLifeTimeInSeconds = 5.0;
   if (manager == self.oneTimeLocationManager) {
     CLLocation *latest = locations.lastObject;
     if (-[latest.timestamp timeIntervalSinceNow] > kMaxLocationLifeTimeInSeconds) return;
-    GeolocatorResult result = self.currentLocationResultHandler;
+    if (self.requests.count == 0) return;
+    NSArray<GeolocationRequest *> *requests = self.requests.allValues;
     // Clear before invoking client code: it may start another one-shot request.
     [self stopOneTimeLocationListening];
-    if (result) result(latest);
+    for (GeolocationRequest *request in requests) {
+      request.resultHandler(latest);
+    }
     return;
   }
 
@@ -188,9 +240,12 @@ double const kMaxLocationLifeTimeInSeconds = 5.0;
   }
 
   if (manager == self.oneTimeLocationManager) {
-    GeolocatorError handler = self.oneTimeErrorHandler;
+    if (self.requests.count == 0) return;
+    NSArray<GeolocationRequest *> *requests = self.requests.allValues;
     [self stopOneTimeLocationListening];
-    if (handler) handler(GeolocatorErrorLocationUpdateFailure, error.localizedDescription);
+    for (GeolocationRequest *request in requests) {
+      request.errorHandler(GeolocatorErrorLocationUpdateFailure, error.localizedDescription);
+    }
   } else if (manager == self.locationManager) {
     GeolocatorError handler = self.errorHandler;
     if (handler) handler(GeolocatorErrorLocationUpdateFailure, error.localizedDescription);

@@ -19,6 +19,7 @@
 
 @implementation PositionStreamHandler {
   FlutterEventSink _eventSink;
+  NSDictionary *_pendingArguments;
 }
 
 - (id) initWithGeolocationHandler: (GeolocationHandler * _Nonnull)geolocationHandler {
@@ -42,6 +43,42 @@
   }
 
   _eventSink = eventSink;
+#if TARGET_OS_IOS
+  if ([arguments[@"requireForeground"] boolValue]) {
+    if ([arguments[@"allowBackgroundLocationUpdates"] boolValue] &&
+        ![[[NSBundle mainBundle] objectForInfoDictionaryKey:@"UIBackgroundModes"] containsObject:@"location"]) {
+      _eventSink([FlutterError errorWithCode:@"BACKGROUND_LOCATION_UNAVAILABLE"
+                                   message:@"UIBackgroundModes must include location."
+                                   details:nil]);
+      _eventSink = nil;
+      return nil;
+    }
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+      _pendingArguments = [arguments copy];
+      [[NSNotificationCenter defaultCenter] addObserver:self
+          selector:@selector(applicationDidBecomeActive:)
+          name:UIApplicationDidBecomeActiveNotification object:nil];
+      return nil;
+    }
+  }
+#endif
+  [self startListeningWithArguments:arguments];
+  return nil;
+}
+
+#if TARGET_OS_IOS
+- (void)applicationDidBecomeActive:(NSNotification *)notification {
+  if (!_pendingArguments || !_eventSink ||
+      [UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+  NSDictionary *arguments = _pendingArguments;
+  _pendingArguments = nil;
+  [[NSNotificationCenter defaultCenter] removeObserver:self
+      name:UIApplicationDidBecomeActiveNotification object:nil];
+  [self startListeningWithArguments:arguments];
+}
+#endif
+
+- (void)startListeningWithArguments:(NSDictionary *)arguments {
     
   __weak typeof(self) weakSelf = self;
   
@@ -66,14 +103,22 @@
     [weakSelf onLocationFailureWithErrorCode:errorCode
                             errorDescription:errorDescription];
   }];
-  return nil;
+  if ([arguments[@"requireForeground"] boolValue] && _eventSink) {
+    _eventSink(@{@"event": @"positionStreamStarted"});
+  }
 }
 
 - (FlutterError *_Nullable)onCancelWithArguments:(id _Nullable)arguments {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    _pendingArguments = nil;
     [_geolocationHandler stopListening];
     _eventSink = nil;
     
     return nil;
+}
+
+- (void)dealloc {
+  [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
 - (void)onLocationDidChange:(CLLocation *_Nullable)location {

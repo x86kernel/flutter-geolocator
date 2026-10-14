@@ -459,4 +459,171 @@
   XCTAssertEqual(oneShotResults, 1u);
 }
 
+
+- (void)testConcurrentOneShotsCompleteOnceWithMostAccurateSettings {
+  __block NSUInteger first = 0, second = 0;
+  [_geolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyBestForNavigation
+      requestId:@"first" resultHandler:^(CLLocation *location) { first++; }
+      errorHandler:^(NSString *code, NSString *description) { XCTFail(); }];
+  [_geolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyHundredMeters
+      requestId:@"second" resultHandler:^(CLLocation *location) { second++; }
+      errorHandler:^(NSString *code, NSString *description) { XCTFail(); }];
+  OCMVerify(times(2), [_mockOneTimeLocationManager setDesiredAccuracy:kCLLocationAccuracyBestForNavigation]);
+  OCMVerify(never(), [_mockOneTimeLocationManager setDesiredAccuracy:kCLLocationAccuracyHundredMeters]);
+  OCMVerify(times(1), [_mockOneTimeLocationManager startUpdatingLocation]);
+  CLLocation *fix = [[CLLocation alloc] initWithLatitude:54 longitude:6.4];
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didUpdateLocations:@[fix]];
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didUpdateLocations:@[fix]];
+  XCTAssertEqual(first, 1u);
+  XCTAssertEqual(second, 1u);
+  OCMVerify(times(1), [_mockOneTimeLocationManager stopUpdatingLocation]);
+}
+
+- (void)testConcurrentOneShotErrorsCompleteEveryRequest {
+  __block NSUInteger errors = 0;
+  for (NSString *identifier in @[@"first", @"second"]) {
+    [_geolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyBest
+        requestId:identifier resultHandler:^(CLLocation *location) { XCTFail(); }
+        errorHandler:^(NSString *code, NSString *description) { errors++; }];
+  }
+  NSError *error = [NSError errorWithDomain:kCLErrorDomain code:kCLErrorDenied userInfo:nil];
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didFailWithError:error];
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didFailWithError:error];
+  XCTAssertEqual(errors, 2u);
+  OCMVerify(times(1), [_mockOneTimeLocationManager stopUpdatingLocation]);
+}
+
+- (void)testCancellingOneRequestPreservesOtherRequestAndRecording {
+  __block NSUInteger cancelled = 0, completed = 0, streamed = 0;
+  [self listenForBatchWithHandler:^(CLLocation *location) { streamed++; }];
+  [_geolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyBestForNavigation
+      requestId:@"cancelled" resultHandler:^(CLLocation *location) {
+        XCTAssertNil(location);
+        cancelled++;
+      } errorHandler:^(NSString *code, NSString *description) { XCTFail(); }];
+  [_geolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyHundredMeters
+      requestId:@"remaining" resultHandler:^(CLLocation *location) {
+        XCTAssertNotNil(location);
+        completed++;
+      } errorHandler:^(NSString *code, NSString *description) { XCTFail(); }];
+  [_geolocationHandler cancelGetCurrentPositionWithRequestId:@"cancelled"];
+  OCMVerify(never(), [_mockOneTimeLocationManager stopUpdatingLocation]);
+  OCMVerify(times(1), [_mockOneTimeLocationManager setDesiredAccuracy:kCLLocationAccuracyHundredMeters]);
+  CLLocation *fix = [[CLLocation alloc] initWithLatitude:54 longitude:6.4];
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didUpdateLocations:@[fix]];
+  [_geolocationHandler locationManager:_mockLocationManager didUpdateLocations:@[fix]];
+  XCTAssertEqual(cancelled, 1u);
+  XCTAssertEqual(completed, 1u);
+  XCTAssertEqual(streamed, 1u);
+  OCMVerify(never(), [_mockLocationManager stopUpdatingLocation]);
+}
+
+- (void)testCancellingLastRequestStopsManagerAndIgnoresLateEvents {
+  __block NSUInteger cancelled = 0;
+  [_geolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyBest
+      requestId:@"last" resultHandler:^(CLLocation *location) {
+        XCTAssertNil(location);
+        cancelled++;
+      } errorHandler:^(NSString *code, NSString *description) { XCTFail(); }];
+  [_geolocationHandler cancelGetCurrentPositionWithRequestId:@"unknown"];
+  [_geolocationHandler cancelGetCurrentPositionWithRequestId:nil];
+  OCMVerify(never(), [_mockOneTimeLocationManager stopUpdatingLocation]);
+  [_geolocationHandler cancelGetCurrentPositionWithRequestId:@"last"];
+  [_geolocationHandler cancelGetCurrentPositionWithRequestId:@"last"];
+  CLLocation *fix = [[CLLocation alloc] initWithLatitude:54 longitude:6.4];
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didUpdateLocations:@[fix]];
+  NSError *error = [NSError errorWithDomain:kCLErrorDomain code:kCLErrorDenied userInfo:nil];
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didFailWithError:error];
+  XCTAssertEqual(cancelled, 1u);
+  OCMVerify(times(1), [_mockOneTimeLocationManager stopUpdatingLocation]);
+}
+
+- (void)testCancellationCallbackCanStartAnotherRequest {
+  __block NSUInteger results = 0;
+  GeolocationHandler *handler = _geolocationHandler;
+  [_geolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyBest
+      requestId:@"old" resultHandler:^(CLLocation *location) {
+        XCTAssertNil(location);
+        [handler requestPositionWithDesiredAccuracy:kCLLocationAccuracyBest
+            requestId:@"new" resultHandler:^(CLLocation *next) { results++; }
+            errorHandler:^(NSString *code, NSString *description) { XCTFail(); }];
+      } errorHandler:^(NSString *code, NSString *description) { XCTFail(); }];
+  [_geolocationHandler cancelGetCurrentPositionWithRequestId:@"old"];
+  // A delayed cancellation of the previous request must not consume the new one.
+  [_geolocationHandler cancelGetCurrentPositionWithRequestId:@"old"];
+  CLLocation *fix = [[CLLocation alloc] initWithLatitude:54 longitude:6.4];
+  [_geolocationHandler locationManager:_mockOneTimeLocationManager didUpdateLocations:@[fix]];
+  XCTAssertEqual(results, 1u);
+}
+
+
+- (void)testForegroundStreamAcknowledgesAfterNativeStart {
+  id application = OCMPartialMock([UIApplication sharedApplication]);
+  OCMStub([application applicationState]).andReturn(UIApplicationStateActive);
+  id bundle = OCMPartialMock([NSBundle mainBundle]);
+  OCMStub([bundle objectForInfoDictionaryKey:@"UIBackgroundModes"]).andReturn(@[@"location"]);
+  __block BOOL started = NO;
+  OCMStub([_mockLocationManager startUpdatingLocation]).andDo(^(NSInvocation *invocation) { started = YES; });
+  PositionStreamHandler *stream = [[PositionStreamHandler alloc] initWithGeolocationHandler:_geolocationHandler];
+  __block NSUInteger acknowledgements = 0;
+  [stream onListenWithArguments:@{@"requireForeground": @YES, @"allowBackgroundLocationUpdates": @YES}
+                     eventSink:^(id event) {
+    XCTAssertTrue(started);
+    XCTAssertEqualObjects(event[@"event"], @"positionStreamStarted");
+    acknowledgements++;
+  }];
+  XCTAssertEqual(acknowledgements, 1u);
+  OCMVerify([_mockLocationManager setAllowsBackgroundLocationUpdates:YES]);
+  [stream onCancelWithArguments:nil];
+  [bundle stopMocking];
+  [application stopMocking];
+}
+
+- (void)testForegroundStreamDefersUntilActiveAndDoesNotRestartOnLaterResume {
+  __block UIApplicationState state = UIApplicationStateBackground;
+  id application = OCMPartialMock([UIApplication sharedApplication]);
+  OCMStub([application applicationState]).andDo(^(NSInvocation *invocation) { [invocation setReturnValue:&state]; });
+  PositionStreamHandler *stream = [[PositionStreamHandler alloc] initWithGeolocationHandler:_geolocationHandler];
+  __block NSUInteger acknowledgements = 0;
+  [stream onListenWithArguments:@{@"requireForeground": @YES}
+                     eventSink:^(id event) { acknowledgements++; }];
+  OCMVerify(times(0), [_mockLocationManager startUpdatingLocation]);
+  XCTAssertEqual(acknowledgements, 0u);
+  state = UIApplicationStateActive;
+  [[NSNotificationCenter defaultCenter] postNotificationName:UIApplicationDidBecomeActiveNotification object:nil];
+  OCMVerify(times(1), [_mockLocationManager startUpdatingLocation]);
+  XCTAssertEqual(acknowledgements, 1u);
+  [[NSNotificationCenter defaultCenter] postNotificationName:UIApplicationDidBecomeActiveNotification object:nil];
+  OCMVerify(times(1), [_mockLocationManager startUpdatingLocation]);
+  [stream onCancelWithArguments:nil];
+  [application stopMocking];
+}
+
+- (void)testCancelledForegroundWaitCannotStartOnResume {
+  __block UIApplicationState state = UIApplicationStateInactive;
+  id application = OCMPartialMock([UIApplication sharedApplication]);
+  OCMStub([application applicationState]).andDo(^(NSInvocation *invocation) { [invocation setReturnValue:&state]; });
+  PositionStreamHandler *stream = [[PositionStreamHandler alloc] initWithGeolocationHandler:_geolocationHandler];
+  [stream onListenWithArguments:@{@"requireForeground": @YES}
+                     eventSink:^(id event) { XCTFail(@"Cancelled startup must not acknowledge"); }];
+  [stream onCancelWithArguments:nil];
+  state = UIApplicationStateActive;
+  [[NSNotificationCenter defaultCenter] postNotificationName:UIApplicationDidBecomeActiveNotification object:nil];
+  OCMVerify(times(0), [_mockLocationManager startUpdatingLocation]);
+  [application stopMocking];
+}
+
+- (void)testForegroundStreamRejectsMissingBackgroundMode {
+  id bundle = OCMPartialMock([NSBundle mainBundle]);
+  OCMStub([bundle objectForInfoDictionaryKey:@"UIBackgroundModes"]).andReturn(@[]);
+  PositionStreamHandler *stream = [[PositionStreamHandler alloc] initWithGeolocationHandler:_geolocationHandler];
+  __block FlutterError *failure;
+  [stream onListenWithArguments:@{@"requireForeground": @YES, @"allowBackgroundLocationUpdates": @YES}
+                     eventSink:^(id event) { failure = event; }];
+  XCTAssertEqualObjects(failure.code, @"BACKGROUND_LOCATION_UNAVAILABLE");
+  OCMVerify(times(0), [_mockLocationManager startUpdatingLocation]);
+  [stream onCancelWithArguments:nil];
+  [bundle stopMocking];
+}
+
 @end

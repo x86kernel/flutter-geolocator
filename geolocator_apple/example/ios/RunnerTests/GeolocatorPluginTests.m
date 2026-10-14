@@ -160,7 +160,7 @@
   }];
   
   OCMVerify(times(1), [mockPermissionHandler hasPermission]);
-  OCMVerify(never(), [mockGeolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyBest resultHandler:[OCMArg any] errorHandler:[OCMArg any]]);
+  OCMVerify(never(), [mockGeolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyBest requestId:[OCMArg any] resultHandler:[OCMArg any] errorHandler:[OCMArg any]]);
   [self waitForExpectationsWithTimeout:5.0 handler:nil];
 }
 
@@ -173,7 +173,7 @@
   [plugin setPermissionHandlerOverride:mockPermissionHandler];
   
   OCMStub([mockPermissionHandler hasPermission]).andReturn(YES);
-  OCMStub([mockGeolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyHundredMeters
+  OCMStub([mockGeolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyHundredMeters requestId:[OCMArg any]
                                                        resultHandler:([OCMArg invokeBlockWithArgs:dummyLocation, nil])
                                                         errorHandler:[OCMArg any]]);
   
@@ -188,7 +188,7 @@
   }];
   
   OCMVerify(times(1), [mockPermissionHandler hasPermission]);
-  OCMVerify(times(1), [mockGeolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyHundredMeters resultHandler:[OCMArg any] errorHandler:[OCMArg any]]);
+  OCMVerify(times(1), [mockGeolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyHundredMeters requestId:[OCMArg any] resultHandler:[OCMArg any] errorHandler:[OCMArg any]]);
   [self waitForExpectationsWithTimeout:5.0 handler:nil];
 }
 
@@ -200,7 +200,7 @@
   [plugin setPermissionHandlerOverride:mockPermissionHandler];
   
   OCMStub([mockPermissionHandler hasPermission]).andReturn(YES);
-  OCMStub([mockGeolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyHundredMeters
+  OCMStub([mockGeolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyHundredMeters requestId:[OCMArg any]
                                                        resultHandler:[OCMArg any]
                                                         errorHandler:([OCMArg invokeBlockWithArgs:@"error_code", @"error_description", nil])]);
   
@@ -216,7 +216,7 @@
   }];
   
   OCMVerify(times(1), [mockPermissionHandler hasPermission]);
-  OCMVerify(times(1), [mockGeolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyHundredMeters resultHandler:[OCMArg any] errorHandler:[OCMArg any]]);
+  OCMVerify(times(1), [mockGeolocationHandler requestPositionWithDesiredAccuracy:kCLLocationAccuracyHundredMeters requestId:[OCMArg any] resultHandler:[OCMArg any] errorHandler:[OCMArg any]]);
   [self waitForExpectationsWithTimeout:5.0 handler:nil];
 }
 
@@ -351,6 +351,65 @@
   }];
   
   [self waitForExpectationsWithTimeout:5.0 handler:nil];
+}
+
+
+- (void)testCancelCurrentPositionRoutesRequestIdWithoutPermissionCheck {
+  id handler = OCMClassMock([GeolocationHandler class]);
+  id permission = OCMStrictClassMock([PermissionHandler class]);
+  GeolocatorPlugin *plugin = [[GeolocatorPlugin alloc] init];
+  [plugin setGeolocationHandlerOverride:handler];
+  [plugin setPermissionHandlerOverride:permission];
+  __block NSUInteger replies = 0;
+  [plugin handleMethodCall:[FlutterMethodCall methodCallWithMethodName:@"cancelGetCurrentPosition"
+      arguments:@{@"requestId": @"timed-out"}] result:^(id result) {
+    XCTAssertNil(result);
+    replies++;
+  }];
+  OCMVerify(times(1), [handler cancelGetCurrentPositionWithRequestId:@"timed-out"]);
+  XCTAssertEqual(replies, 1u);
+}
+
+- (void)testServiceStatusCancellationDropsQueuedCallback {
+  [self checkQueuedServiceStatusWithReplacement:NO];
+}
+
+- (void)testServiceStatusResubscribeDropsPreviousGeneration {
+  [self checkQueuedServiceStatusWithReplacement:YES];
+}
+
+- (void)checkQueuedServiceStatusWithReplacement:(BOOL)replace {
+  id manager = OCMClassMock(CLLocationManager.class);
+  dispatch_semaphore_t queried = dispatch_semaphore_create(0);
+  OCMStub(ClassMethod([manager locationServicesEnabled])).andDo(^(NSInvocation *invocation) {
+    dispatch_semaphore_signal(queried);
+  }).andReturn(YES);
+  LocationServiceStreamHandler *handler = [[LocationServiceStreamHandler alloc] init];
+  [handler setValue:manager forKey:@"locationManager"];
+  XCTestExpectation *unexpected = [self expectationWithDescription:@"No event after cancellation"];
+  unexpected.inverted = YES;
+  [handler onListenWithArguments:nil eventSink:^(id event) { [unexpected fulfill]; }];
+  [handler locationManager:manager didChangeAuthorizationStatus:kCLAuthorizationStatusAuthorizedAlways];
+  // Keep the main queue occupied until the background query has started, so its
+  // result can only be delivered after cancellation (and possible re-listening).
+  XCTAssertEqual(dispatch_semaphore_wait(queried, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)), 0);
+  [handler onCancelWithArguments:nil];
+  if (replace) {
+    [handler setValue:manager forKey:@"locationManager"];
+    [handler onListenWithArguments:nil eventSink:^(id event) { [unexpected fulfill]; }];
+  }
+  [self waitForExpectations:@[unexpected] timeout:0.1];
+  if (replace) {
+    XCTestExpectation *current = [self expectationWithDescription:@"New listener receives current status"];
+    [handler onListenWithArguments:nil eventSink:^(id event) {
+      XCTAssertEqualObjects(event, @1);
+      [current fulfill];
+    }];
+    [handler locationManager:manager didChangeAuthorizationStatus:kCLAuthorizationStatusAuthorizedAlways];
+    [self waitForExpectations:@[current] timeout:2];
+  }
+  [handler onCancelWithArguments:nil];
+  [manager stopMocking];
 }
 
 @end

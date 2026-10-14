@@ -92,6 +92,9 @@
   } else if ([@"getCurrentPosition" isEqualToString:call.method]) {
     [self onGetCurrentPositionWithArguments:call.arguments
                                      result:result];
+  } else if ([@"cancelGetCurrentPosition" isEqualToString:call.method]) {
+    [self.geolocationHandler cancelGetCurrentPositionWithRequestId:call.arguments[@"requestId"]];
+    result(nil);
   } else if([@"getLocationAccuracy" isEqualToString:call.method]) {
     [[self createLocationAccuracyHandler] getLocationAccuracyWithResult:result];
   } else if([@"requestTemporaryFullAccuracy" isEqualToString:call.method]) {
@@ -158,6 +161,7 @@
   GeolocationHandler *geolocationHandler = [self createGeolocationHandler];
   
   [geolocationHandler requestPositionWithDesiredAccuracy:accuracy
+                                               requestId:arguments[@"requestId"]
                                            resultHandler:^(CLLocation *location) {
     result([LocationMapper toDictionary:location]);
   }
